@@ -13,7 +13,7 @@
 #define PCF8574_INPUT 0x22
 
 // --- WiFi AP ---
-const char* ap_ssid = "awh";
+const char* ap_ssid = "microwave";
 const char* ap_password = "clickclick";
 
 // --- Ethernet / Modbus TCP (W5500) ---
