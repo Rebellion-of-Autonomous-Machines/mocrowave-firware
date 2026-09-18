@@ -37,7 +37,7 @@ const uint32_t STARTUP_CLOSE_TIMEOUT_MS = 15000;
 const uint32_t DOOR_OPEN_DURATION_MS = 6000;
 const uint8_t RELAY_MOTOR_A = 4; // Physical relay 5
 const uint8_t RELAY_MOTOR_B = 5; // Physical relay 6
-const uint8_t DI5_BIT = 4; // P4 on input PCF8574 (IN_D5 on your schematic)
+const uint8_t DI5_BIT = 4; // P4 on input PCF8574
 const bool DI5_ACTIVE_LOW = true;
 
 // PCF8574 relay modules are usually active-low: true means relay coil ON (NO state).
