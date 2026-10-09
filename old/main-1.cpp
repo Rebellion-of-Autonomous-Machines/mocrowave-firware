@@ -3,7 +3,7 @@
 #include <WebServer.h>
 
 // Название сети и пароль для точки доступа
-const char* ap_ssid = "awn";
+const char* ap_ssid = "microwave";
 const char* ap_password = "clickclick";
 
 // Пины I2C и адрес PCF8574

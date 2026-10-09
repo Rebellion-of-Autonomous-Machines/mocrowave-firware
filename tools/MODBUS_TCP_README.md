@@ -7,7 +7,7 @@
 - Статический адрес по умолчанию: `192.168.1.50`.
 - Маска: `255.255.255.0`.
 - Шлюз и DNS: `192.168.1.1`.
-- Через Wi-Fi `awh` можно выбрать статический адрес или DHCP.
+- Через Wi-Fi `microwave` можно выбрать статический адрес или DHCP.
 
 Поддерживаются функции `03` (Holding Registers), `04` (Input Registers), `06` (Write Single Register) и `16` (Write Multiple Registers).
 
