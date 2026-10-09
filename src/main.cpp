@@ -88,25 +88,37 @@ uint32_t doorOpenStartedMs = 0;
 bool di5Active = false;
 
 enum ModbusReg : uint16_t {
-  REG_COMMAND = 0,
-  REG_SET_TIME_SECONDS = 1,
-  REG_REMAINING_TIME_SECONDS = 2,
-  REG_POWER_STATE = 3,
-  REG_DOOR_STATE = 4,
-  REG_LIMIT_SWITCH_STATE = 5,
-  REG_MOTOR_DIRECTION = 6,
-  REG_PERMISSION_STATE = 7,
-  REG_COMMAND_RESULT = 8,
-  REG_ERROR_CODE = 9,
-  REG_OPEN_REMAINING_SECONDS = 10,
+  REG_STAT_MODE = 0,               // 40001
+  REG_STAT_ERROR = 1,              // 40002
+  REG_MAN_CONTROL_C = 2,           // 40003
+  REG_MAN_CONTROL_X = 3,           // 40004
+  REG_MAN_CONTROL_Y = 4,           // 40005
+  REG_MAN_CONTROL_Z = 5,           // 40006
+  REG_SET_TIME_SECONDS = 6,        // 40007 Man_Time
+  REG_COMMAND = 7,                 // 40008 compatible high-level command
+  REG_REMAINING_TIME_SECONDS = 8,  // 40009
+  REG_POWER_STATE = 9,             // 40010
+  REG_DOOR_STATE = 10,             // 40011
+  REG_LIMIT_SWITCH_STATE = 11,     // 40012
+  REG_MOTOR_DIRECTION = 12,        // 40013
+  REG_PERMISSION_STATE = 13,       // 40014
+  REG_COMMAND_RESULT = 14,         // 40015
+  REG_OPEN_REMAINING_SECONDS = 15, // 40016
   REG_REG_COUNT = 32
+};
+
+enum InputReg : uint16_t {
+  IREG_TIME_ALL = 0,       // 30001
+  IREG_TIME_HEAT = 1,      // 30002
+  IREG_END_OPEN = 20,      // 30021
+  IREG_END_CLOSED = 21,    // 30022
+  INPUT_REG_COUNT = 22
 };
 
 enum ModbusCommand : uint16_t {
   CMD_NONE = 0,
   CMD_OPEN_DOOR = 1,
   CMD_CLOSE_DOOR = 2,
-  CMD_STOP_DOOR = 3,
   CMD_POWER_ON = 4,
   CMD_POWER_OFF = 5,
   CMD_CLEAR_ERROR = 6
@@ -117,20 +129,38 @@ enum ModbusCommandResult : uint16_t {
   CMD_RESULT_UNKNOWN_COMMAND = 1,
   CMD_RESULT_BUSY = 2,
   CMD_RESULT_NOT_ALLOWED = 3,
-  CMD_RESULT_INVALID_VALUE = 4
+  CMD_RESULT_INVALID_VALUE = 4,
+  CMD_RESULT_MANUAL_CONTROL_FORBIDDEN = 6
 };
 
-enum ModbusErrorCode : uint16_t {
+enum AutomationState : uint16_t {
+  STAT_INITIAL = 1,
+  STAT_OPENING = 11,
+  STAT_HEATING = 12,
+  STAT_CLOSING = 13,
+  STAT_COMPLETE = 19,
+  STAT_ERROR = 99
+};
+
+enum AutomationError : uint16_t {
   ERROR_NONE = 0,
-  ERROR_DOOR_STARTUP_CLOSE_TIMEOUT = 1,
-  ERROR_POWER_ON_DOOR_NOT_CLOSED = 2,
-  ERROR_POWER_ON_ZERO_TIME = 3,
-  ERROR_DOOR_COMMAND_WHILE_POWER_ON = 4
+  ERROR_MANUAL_MODE_REQUIRED = 100,
+  ERROR_COMMAND_BUSY = 101,
+  ERROR_INVALID_COMMAND = 102,
+  ERROR_DIRECT_RELAY_CONTROL_FORBIDDEN = 105
 };
 
 uint16_t modbusRegs[REG_REG_COUNT] = {0};
+uint16_t inputRegs[INPUT_REG_COUNT] = {0};
 uint16_t commandResult = CMD_RESULT_OK;
 uint16_t errorCode = ERROR_NONE;
+uint16_t automationState = STAT_INITIAL;
+uint64_t totalRuntimeSeconds = 0;
+uint64_t heatRuntimeSeconds = 0;
+uint64_t lastSavedTotalRuntimeSeconds = 0;
+uint64_t lastSavedHeatRuntimeSeconds = 0;
+uint32_t runtimeTickMs = 0;
+const uint32_t RUNTIME_SAVE_INTERVAL_SECONDS = 600;
 
 bool parseIPv4(const String& text, IPAddress& address) {
   String value = text;
@@ -174,6 +204,50 @@ bool saveNetworkSettings() {
   saved &= preferences.putBool("dhcp", ethernetUseDhcp) > 0;
   preferences.end();
   return saved;
+}
+
+void loadRuntimeTelemetry() {
+  Preferences preferences;
+  if (preferences.begin("runtime", true)) {
+    totalRuntimeSeconds = preferences.getULong64("total", 0);
+    heatRuntimeSeconds = preferences.getULong64("heat", 0);
+    preferences.end();
+  }
+  lastSavedTotalRuntimeSeconds = totalRuntimeSeconds;
+  lastSavedHeatRuntimeSeconds = heatRuntimeSeconds;
+  runtimeTickMs = millis();
+}
+
+void saveRuntimeTelemetry() {
+  Preferences preferences;
+  if (!preferences.begin("runtime", false)) {
+    return;
+  }
+  preferences.putULong64("total", totalRuntimeSeconds);
+  preferences.putULong64("heat", heatRuntimeSeconds);
+  preferences.end();
+  lastSavedTotalRuntimeSeconds = totalRuntimeSeconds;
+  lastSavedHeatRuntimeSeconds = heatRuntimeSeconds;
+}
+
+void updateRuntimeTelemetry() {
+  uint32_t now = millis();
+  uint32_t elapsedSeconds = (now - runtimeTickMs) / 1000;
+  if (elapsedSeconds == 0) {
+    return;
+  }
+
+  runtimeTickMs += elapsedSeconds * 1000;
+  const uint64_t maxSeconds = 65535ULL * 3600ULL;
+  totalRuntimeSeconds = min(totalRuntimeSeconds + elapsedSeconds, maxSeconds);
+  if (powerOn) {
+    heatRuntimeSeconds = min(heatRuntimeSeconds + elapsedSeconds, maxSeconds);
+  }
+
+  if ((totalRuntimeSeconds - lastSavedTotalRuntimeSeconds) >= RUNTIME_SAVE_INTERVAL_SECONDS ||
+      (heatRuntimeSeconds - lastSavedHeatRuntimeSeconds) >= RUNTIME_SAVE_INTERVAL_SECONDS) {
+    saveRuntimeTelemetry();
+  }
 }
 
 void applyEthernetSettings() {
@@ -261,7 +335,7 @@ void setPowerOff() {
 }
 
 void setPowerOn() {
-  if (powerOn || remainingSeconds == 0 || !doorIsClosed) {
+  if (powerOn || remainingSeconds == 0 || !doorIsClosed || !di5Active) {
     return;
   }
 
@@ -335,7 +409,7 @@ const char* directionText() {
   if (currentDirection == MOTOR_CLOSE) {
     return "Закрыть";
   }
-  return "Стоп";
+  return "Не движется";
 }
 
 const char* doorText() {
@@ -360,11 +434,11 @@ bool doorMoving() {
 }
 
 bool canAdjustTime() {
-  return !startupDoorClosing && !powerOn;
+  return !startupDoorClosing && !powerOn && !doorMoving();
 }
 
 bool canPowerOn() {
-  return !startupDoorClosing && !powerOn && remainingSeconds > 0 && doorIsClosed;
+  return !startupDoorClosing && !powerOn && remainingSeconds > 0 && doorIsClosed && di5Active;
 }
 
 bool canPowerOff() {
@@ -372,15 +446,11 @@ bool canPowerOff() {
 }
 
 bool canOpenDoor() {
-  return !startupDoorClosing && !powerOn && currentDirection != MOTOR_OPEN && !doorIsOpen;
+  return !startupDoorClosing && !powerOn && currentDirection == MOTOR_STOP && doorIsClosed && di5Active;
 }
 
 bool canCloseDoor() {
-  return !startupDoorClosing && !powerOn && currentDirection != MOTOR_CLOSE && !di5Active && !doorIsClosed;
-}
-
-bool canStopDoor() {
-  return !startupDoorClosing && !powerOn && currentDirection != MOTOR_STOP && !di5Active && !doorIsOpen && !doorIsClosed;
+  return !startupDoorClosing && !powerOn && currentDirection == MOTOR_STOP && doorIsOpen && !di5Active;
 }
 
 void updateInputStates() {
@@ -403,6 +473,8 @@ void updateDoorStateFromLimitSwitches() {
 
   if (currentDirection == MOTOR_OPEN || currentDirection == MOTOR_CLOSE) {
     doorIsOpen = false;
+    doorIsClosed = false;
+  } else if (!doorIsOpen) {
     doorIsClosed = false;
   }
 }
@@ -432,7 +504,9 @@ void ensureDoorClosedOnStartup() {
   updateInputStates();
   updateDoorStateFromLimitSwitches();
   if (!doorIsClosed) {
-    errorCode = ERROR_DOOR_STARTUP_CLOSE_TIMEOUT;
+    errorCode = ERROR_INVALID_COMMAND;
+    automationState = STAT_ERROR;
+    commandResult = CMD_RESULT_NOT_ALLOWED;
   }
   startupDoorClosing = false;
 }
@@ -471,9 +545,6 @@ uint16_t permissionState() {
   if (canCloseDoor()) {
     bitSet(bits, 2);
   }
-  if (canStopDoor()) {
-    bitSet(bits, 3);
-  }
   if (canAdjustTime()) {
     bitSet(bits, 4);
   }
@@ -496,17 +567,54 @@ uint16_t openRemainingSeconds() {
 }
 
 void syncModbusRegistersFromState() {
+  modbusRegs[REG_STAT_MODE] = automationState;
+  modbusRegs[REG_STAT_ERROR] = errorCode;
   modbusRegs[REG_COMMAND] = CMD_NONE;
   modbusRegs[REG_SET_TIME_SECONDS] = cycleStartSeconds > 0 ? cycleStartSeconds : remainingSeconds;
   modbusRegs[REG_REMAINING_TIME_SECONDS] = remainingSeconds;
   modbusRegs[REG_POWER_STATE] = powerState();
   modbusRegs[REG_DOOR_STATE] = doorState();
-  modbusRegs[REG_LIMIT_SWITCH_STATE] = di5Active ? 1 : 0;
+  modbusRegs[REG_LIMIT_SWITCH_STATE] = (doorIsOpen ? 1U : 0U) | (di5Active ? 2U : 0U);
   modbusRegs[REG_MOTOR_DIRECTION] = (uint16_t)currentDirection;
   modbusRegs[REG_PERMISSION_STATE] = permissionState();
   modbusRegs[REG_COMMAND_RESULT] = commandResult;
-  modbusRegs[REG_ERROR_CODE] = errorCode;
   modbusRegs[REG_OPEN_REMAINING_SECONDS] = openRemainingSeconds();
+
+  inputRegs[IREG_TIME_ALL] = (uint16_t)min(totalRuntimeSeconds / 3600ULL, 65535ULL);
+  inputRegs[IREG_TIME_HEAT] = (uint16_t)min(heatRuntimeSeconds / 3600ULL, 65535ULL);
+  inputRegs[IREG_END_OPEN] = doorIsOpen ? 1 : 0;
+  inputRegs[IREG_END_CLOSED] = di5Active ? 1 : 0;
+}
+
+void setAutomationError(uint16_t newError, uint16_t result) {
+  if (doorMoving()) {
+    stopMotor();
+  }
+  if (powerOn) {
+    setPowerOff();
+  }
+  errorCode = newError;
+  automationState = STAT_ERROR;
+  commandResult = result;
+}
+
+void clearManualControlRegisters() {
+  modbusRegs[REG_MAN_CONTROL_C] = 0;
+  modbusRegs[REG_MAN_CONTROL_X] = 0;
+  modbusRegs[REG_MAN_CONTROL_Y] = 0;
+  modbusRegs[REG_MAN_CONTROL_Z] = 0;
+}
+
+void processManualControlRegisters() {
+  if (modbusRegs[REG_MAN_CONTROL_C] == 0 &&
+      modbusRegs[REG_MAN_CONTROL_X] == 0 &&
+      modbusRegs[REG_MAN_CONTROL_Y] == 0 &&
+      modbusRegs[REG_MAN_CONTROL_Z] == 0) {
+    return;
+  }
+  clearManualControlRegisters();
+  setAutomationError(ERROR_DIRECT_RELAY_CONTROL_FORBIDDEN, CMD_RESULT_MANUAL_CONTROL_FORBIDDEN);
+  syncModbusRegistersFromState();
 }
 
 void executeModbusCommand(uint16_t cmd) {
@@ -517,78 +625,106 @@ void executeModbusCommand(uint16_t cmd) {
     syncModbusRegistersFromState();
     return;
   }
+  if (doorMoving()) {
+    commandResult = CMD_RESULT_BUSY;
+    syncModbusRegistersFromState();
+    return;
+  }
 
   switch (cmd) {
     case CMD_NONE:
       break;
     case CMD_OPEN_DOOR:
       if (powerOn) {
-        commandResult = CMD_RESULT_BUSY;
-        errorCode = ERROR_DOOR_COMMAND_WHILE_POWER_ON;
+        setAutomationError(ERROR_COMMAND_BUSY, CMD_RESULT_BUSY);
       } else if (!canOpenDoor()) {
-        commandResult = CMD_RESULT_NOT_ALLOWED;
+        setAutomationError(ERROR_INVALID_COMMAND, CMD_RESULT_NOT_ALLOWED);
       } else {
         setMotorDirectionSafe(MOTOR_OPEN);
         doorOpenStartedMs = millis();
         doorIsOpen = false;
         doorIsClosed = false;
+        automationState = STAT_OPENING;
+        errorCode = ERROR_NONE;
       }
       break;
     case CMD_CLOSE_DOOR:
       if (powerOn) {
-        commandResult = CMD_RESULT_BUSY;
-        errorCode = ERROR_DOOR_COMMAND_WHILE_POWER_ON;
+        setAutomationError(ERROR_COMMAND_BUSY, CMD_RESULT_BUSY);
       } else if (!canCloseDoor()) {
-        commandResult = CMD_RESULT_NOT_ALLOWED;
+        setAutomationError(ERROR_INVALID_COMMAND, CMD_RESULT_NOT_ALLOWED);
       } else {
         setMotorDirectionSafe(MOTOR_CLOSE);
         doorIsOpen = false;
         doorIsClosed = false;
-      }
-      break;
-    case CMD_STOP_DOOR:
-      if (powerOn) {
-        commandResult = CMD_RESULT_BUSY;
-        errorCode = ERROR_DOOR_COMMAND_WHILE_POWER_ON;
-      } else if (!canStopDoor()) {
-        commandResult = CMD_RESULT_NOT_ALLOWED;
-      } else {
-        stopMotor();
+        automationState = STAT_CLOSING;
+        errorCode = ERROR_NONE;
       }
       break;
     case CMD_POWER_ON:
       if (remainingSeconds == 0) {
-        commandResult = CMD_RESULT_INVALID_VALUE;
-        errorCode = ERROR_POWER_ON_ZERO_TIME;
-      } else if (!doorIsClosed) {
-        commandResult = CMD_RESULT_NOT_ALLOWED;
-        errorCode = ERROR_POWER_ON_DOOR_NOT_CLOSED;
+        setAutomationError(ERROR_INVALID_COMMAND, CMD_RESULT_INVALID_VALUE);
+      } else if (!doorIsClosed || !di5Active) {
+        setAutomationError(ERROR_INVALID_COMMAND, CMD_RESULT_NOT_ALLOWED);
       } else if (powerOn) {
-        commandResult = CMD_RESULT_BUSY;
+        setAutomationError(ERROR_COMMAND_BUSY, CMD_RESULT_BUSY);
       } else {
         setPowerOn();
+        automationState = STAT_HEATING;
+        errorCode = ERROR_NONE;
       }
       break;
     case CMD_POWER_OFF:
       if (!canPowerOff()) {
-        commandResult = CMD_RESULT_NOT_ALLOWED;
+        setAutomationError(ERROR_INVALID_COMMAND, CMD_RESULT_NOT_ALLOWED);
       } else {
         setPowerOff();
+        automationState = STAT_COMPLETE;
+        errorCode = ERROR_NONE;
       }
       break;
     case CMD_CLEAR_ERROR:
       errorCode = ERROR_NONE;
+      automationState = STAT_INITIAL;
       commandResult = CMD_RESULT_OK;
       break;
     default:
-      commandResult = CMD_RESULT_UNKNOWN_COMMAND;
+      setAutomationError(ERROR_INVALID_COMMAND, CMD_RESULT_UNKNOWN_COMMAND);
       break;
   }
 
   syncModbusRegistersFromState();
 }
 
-bool writeModbusRegister(uint16_t address, uint16_t value) {
+void handleAutomationStateWrite(uint16_t requestedState) {
+  if (requestedState == STAT_INITIAL) {
+    if (doorMoving() || powerOn) {
+      setAutomationError(ERROR_COMMAND_BUSY, CMD_RESULT_BUSY);
+    } else {
+      automationState = STAT_INITIAL;
+      errorCode = ERROR_NONE;
+      commandResult = CMD_RESULT_OK;
+    }
+    return;
+  }
+
+  if (automationState != STAT_INITIAL) {
+    setAutomationError(ERROR_INVALID_COMMAND, CMD_RESULT_NOT_ALLOWED);
+    return;
+  }
+
+  if (requestedState == STAT_OPENING) {
+    executeModbusCommand(CMD_OPEN_DOOR);
+  } else if (requestedState == STAT_HEATING) {
+    executeModbusCommand(CMD_POWER_ON);
+  } else if (requestedState == STAT_CLOSING) {
+    executeModbusCommand(CMD_CLOSE_DOOR);
+  } else {
+    setAutomationError(ERROR_INVALID_COMMAND, CMD_RESULT_UNKNOWN_COMMAND);
+  }
+}
+
+bool writeModbusRegister(uint16_t address, uint16_t value, bool deferManualProcessing = false) {
   if (address >= REG_REG_COUNT) {
     return false;
   }
@@ -596,6 +732,25 @@ bool writeModbusRegister(uint16_t address, uint16_t value) {
   if (startupDoorClosing) {
     commandResult = CMD_RESULT_BUSY;
     syncModbusRegistersFromState();
+    return true;
+  }
+  if (doorMoving()) {
+    commandResult = CMD_RESULT_BUSY;
+    syncModbusRegistersFromState();
+    return true;
+  }
+
+  if (address == REG_STAT_MODE) {
+    handleAutomationStateWrite(value);
+    syncModbusRegistersFromState();
+    return true;
+  }
+
+  if (address >= REG_MAN_CONTROL_C && address <= REG_MAN_CONTROL_Z) {
+    modbusRegs[address] = value;
+    if (!deferManualProcessing) {
+      processManualControlRegisters();
+    }
     return true;
   }
 
@@ -606,12 +761,12 @@ bool writeModbusRegister(uint16_t address, uint16_t value) {
 
   if (address == REG_SET_TIME_SECONDS) {
     if (powerOn) {
-      commandResult = CMD_RESULT_BUSY;
+      setAutomationError(ERROR_COMMAND_BUSY, CMD_RESULT_BUSY);
       syncModbusRegistersFromState();
       return true;
     }
     if (value > 5999) {
-      commandResult = CMD_RESULT_INVALID_VALUE;
+      setAutomationError(ERROR_INVALID_COMMAND, CMD_RESULT_INVALID_VALUE);
       syncModbusRegistersFromState();
       return true;
     }
@@ -686,14 +841,17 @@ void processModbusTcpRequest(EthernetClient& client) {
 
   syncModbusRegistersFromState();
 
-  if (functionCode == 0x03) {
+  if (functionCode == 0x03 || functionCode == 0x04) {
     if (pduLen < 5) {
       sendModbusException(client, header, functionCode, 0x03);
       return;
     }
     uint16_t startAddress = word(pdu[1], pdu[2]);
     uint16_t quantity = word(pdu[3], pdu[4]);
-    if (quantity == 0 || quantity > 60 || (startAddress + quantity) > REG_REG_COUNT) {
+    uint16_t registerCount = functionCode == 0x03
+        ? (uint16_t)REG_REG_COUNT
+        : (uint16_t)INPUT_REG_COUNT;
+    if (quantity == 0 || quantity > 60 || (startAddress + quantity) > registerCount) {
       sendModbusException(client, header, functionCode, 0x02);
       return;
     }
@@ -702,7 +860,9 @@ void processModbusTcpRequest(EthernetClient& client) {
     response[0] = functionCode;
     response[1] = quantity * 2;
     for (uint16_t i = 0; i < quantity; i++) {
-      uint16_t value = modbusRegs[startAddress + i];
+      uint16_t value = functionCode == 0x03
+          ? modbusRegs[startAddress + i]
+          : inputRegs[startAddress + i];
       response[2 + (i * 2)] = highByte(value);
       response[3 + (i * 2)] = lowByte(value);
     }
@@ -737,12 +897,19 @@ void processModbusTcpRequest(EthernetClient& client) {
       sendModbusException(client, header, functionCode, 0x02);
       return;
     }
+    bool manualRegistersWritten = false;
     for (uint16_t i = 0; i < quantity; i++) {
+      uint16_t address = startAddress + i;
       uint16_t value = word(pdu[6 + (i * 2)], pdu[7 + (i * 2)]);
-      if (!writeModbusRegister(startAddress + i, value)) {
+      bool isManualRegister = address >= REG_MAN_CONTROL_C && address <= REG_MAN_CONTROL_Z;
+      if (!writeModbusRegister(address, value, isManualRegister)) {
         sendModbusException(client, header, functionCode, 0x02);
         return;
       }
+      manualRegistersWritten |= isManualRegister;
+    }
+    if (manualRegistersWritten) {
+      processManualControlRegisters();
     }
     uint8_t response[5] = {functionCode, pdu[1], pdu[2], pdu[3], pdu[4]};
     sendModbusTcpResponse(client, header, response, sizeof(response));
@@ -781,7 +948,6 @@ String generateHTML() {
       --muted: #475569;
       --open: #2563eb;
       --close: #dc2626;
-      --stop: #0f766e;
     }
     * { box-sizing: border-box; }
     body {
@@ -875,7 +1041,6 @@ String generateHTML() {
     }
     .open { background: var(--open); }
     .close { background: var(--close); }
-    .stop { background: var(--stop); }
     .network {
       margin-top: 20px;
       padding-top: 18px;
@@ -1008,6 +1173,11 @@ String generateHTML() {
   html += closedLimitText();
 
   html += R"rawliteral(</b></div>
+    <div class="status">Блокировка нагрева дверью: <b id="heat-interlock">)rawliteral";
+
+  html += (doorIsClosed && di5Active) ? "Снята" : "Активна";
+
+  html += R"rawliteral(</b></div>
 
     <div class="row">
       <form action="/close" method="post">
@@ -1025,13 +1195,6 @@ String generateHTML() {
   html += R"rawliteral(>Открыть</button>
       </form>
     </div>
-    <form action="/stop" method="post">
-      <button id="door-stop" class="stop" type="submit" )rawliteral";
-  if (!canStopDoor()) {
-    html += "disabled";
-  }
-  html += R"rawliteral(>Стоп</button>
-    </form>
     <section class="network">
       <h2>Настройки Ethernet / Modbus TCP</h2>
 )rawliteral";
@@ -1104,6 +1267,7 @@ String generateHTML() {
         document.getElementById('direction-text').textContent = status.direction;
         document.getElementById('door-text').textContent = status.door;
         document.getElementById('closed-limit-text').textContent = status.closedLimit;
+        document.getElementById('heat-interlock').textContent = status.doorHeatSafe ? 'Снята' : 'Активна';
         document.querySelector('.time-display').textContent = status.time;
         document.getElementById('min-plus').disabled = !status.canAdjustTime;
         document.getElementById('sec-plus').disabled = !status.canAdjustTime;
@@ -1113,7 +1277,6 @@ String generateHTML() {
         document.getElementById('power-off').disabled = !status.canPowerOff;
         document.getElementById('door-open').disabled = !status.canOpenDoor;
         document.getElementById('door-close').disabled = !status.canCloseDoor;
-        document.getElementById('door-stop').disabled = !status.canStopDoor;
         document.getElementById('ethernet-status').textContent = status.ethernetStatus;
         document.getElementById('ethernet-current-ip').textContent = status.ethernetIp;
         document.getElementById('ethernet-current-subnet').textContent = status.ethernetSubnet;
@@ -1161,12 +1324,12 @@ void handleStatus() {
   json += "\"direction\":\"" + String(directionText()) + "\",";
   json += "\"door\":\"" + String(doorText()) + "\",";
   json += "\"closedLimit\":\"" + String(closedLimitText()) + "\",";
+  json += "\"doorHeatSafe\":" + String((doorIsClosed && di5Active) ? "true" : "false") + ",";
   json += "\"canAdjustTime\":" + String(canAdjustTime() ? "true" : "false") + ",";
   json += "\"canPowerOn\":" + String(canPowerOn() ? "true" : "false") + ",";
   json += "\"canPowerOff\":" + String(canPowerOff() ? "true" : "false") + ",";
   json += "\"canOpenDoor\":" + String(canOpenDoor() ? "true" : "false") + ",";
   json += "\"canCloseDoor\":" + String(canCloseDoor() ? "true" : "false") + ",";
-  json += "\"canStopDoor\":" + String(canStopDoor() ? "true" : "false") + ",";
   json += "\"startupClosing\":" + String(startupDoorClosing ? "true" : "false") + ",";
   json += "\"ethernetStatus\":\"" + String(ethernetConnectionText()) + "\",";
   json += "\"ethernetIp\":\"" + Ethernet.localIP().toString() + "\",";
@@ -1190,14 +1353,7 @@ void handleOpen() {
   if (rejectWebCommandDuringStartup()) {
     return;
   }
-  if (powerOn) {
-    handleRoot();
-    return;
-  }
-  if (doorIsOpen) {
-    stopMotor();
-    doorIsOpen = true;
-    doorIsClosed = false;
+  if (doorMoving() || !canOpenDoor()) {
     handleRoot();
     return;
   }
@@ -1205,6 +1361,8 @@ void handleOpen() {
   doorOpenStartedMs = millis();
   doorIsOpen = false;
   doorIsClosed = false;
+  automationState = STAT_OPENING;
+  errorCode = ERROR_NONE;
   handleRoot();
 }
 
@@ -1212,32 +1370,15 @@ void handleClose() {
   if (rejectWebCommandDuringStartup()) {
     return;
   }
-  if (powerOn) {
-    handleRoot();
-    return;
-  }
-  if (di5Active || doorIsClosed) {
-    stopMotor();
-    doorIsOpen = false;
-    doorIsClosed = true;
+  if (doorMoving() || !canCloseDoor()) {
     handleRoot();
     return;
   }
   setMotorDirectionSafe(MOTOR_CLOSE);
   doorIsOpen = false;
   doorIsClosed = false;
-  handleRoot();
-}
-
-void handleStop() {
-  if (rejectWebCommandDuringStartup()) {
-    return;
-  }
-  if (powerOn) {
-    handleRoot();
-    return;
-  }
-  stopMotor();
+  automationState = STAT_CLOSING;
+  errorCode = ERROR_NONE;
   handleRoot();
 }
 
@@ -1245,7 +1386,11 @@ void handlePowerOn() {
   if (rejectWebCommandDuringStartup()) {
     return;
   }
-  setPowerOn();
+  if (!doorMoving() && canPowerOn()) {
+    setPowerOn();
+    automationState = STAT_HEATING;
+    errorCode = ERROR_NONE;
+  }
   handleRoot();
 }
 
@@ -1253,7 +1398,10 @@ void handlePowerOff() {
   if (rejectWebCommandDuringStartup()) {
     return;
   }
-  setPowerOff();
+  if (!doorMoving() && powerOn) {
+    setPowerOff();
+    automationState = STAT_COMPLETE;
+  }
   handleRoot();
 }
 
@@ -1261,7 +1409,7 @@ void handleTimeAdjust() {
   if (rejectWebCommandDuringStartup()) {
     return;
   }
-  if (!powerOn && server.hasArg("unit") && server.hasArg("delta")) {
+  if (!doorMoving() && !powerOn && server.hasArg("unit") && server.hasArg("delta")) {
     adjustTime(server.arg("unit"), server.arg("delta").toInt());
   }
   handleRoot();
@@ -1359,6 +1507,7 @@ void setup() {
   stopMotor();
   setPowerOff();
   ensureDoorClosedOnStartup();
+  loadRuntimeTelemetry();
 
   SPI.begin();
   Ethernet.init(W5500_CS_PIN);
@@ -1371,7 +1520,6 @@ void setup() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/open", HTTP_POST, handleOpen);
   server.on("/close", HTTP_POST, handleClose);
-  server.on("/stop", HTTP_POST, handleStop);
   server.on("/power_on", HTTP_POST, handlePowerOn);
   server.on("/power_off", HTTP_POST, handlePowerOff);
   server.on("/time_adjust", HTTP_POST, handleTimeAdjust);
@@ -1399,16 +1547,24 @@ void loop() {
   }
   updateInputStates();
   updateDoorStateFromLimitSwitches();
+  updateRuntimeTelemetry();
+
+  if (powerOn && (!di5Active || !doorIsClosed)) {
+    setPowerOff();
+    setAutomationError(ERROR_INVALID_COMMAND, CMD_RESULT_NOT_ALLOWED);
+  }
 
   if (currentDirection == MOTOR_OPEN && doorOpenStartedMs != 0 && (millis() - doorOpenStartedMs) >= DOOR_OPEN_DURATION_MS) {
     stopMotor();
     doorIsOpen = true;
     doorIsClosed = false;
+    automationState = STAT_COMPLETE;
   }
 
   if (di5Active && currentDirection == MOTOR_CLOSE) {
     stopMotor();
     updateDoorStateFromLimitSwitches();
+    automationState = STAT_COMPLETE;
   }
 
   if (powerOn && shuntStartMs != 0 && (millis() - shuntStartMs) >= SHUNT_DELAY_MS) {
@@ -1426,6 +1582,9 @@ void loop() {
       }
       if (remainingSeconds == 0) {
         setPowerOff();
+        automationState = STAT_COMPLETE;
+        errorCode = ERROR_NONE;
+        commandResult = CMD_RESULT_OK;
       }
     }
   }
